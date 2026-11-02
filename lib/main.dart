@@ -108,6 +108,14 @@ class _GalleryNukeScreenState extends State<GalleryNukeScreen> {
       final paths = await PhotoManager.getAssetPathList(
         type: RequestType.image,
         onlyAll: true,
+        filterOption: FilterOptionGroup(
+          orders: [
+            const OrderOption(
+              type: OrderOptionType.createDate,
+              asc: false,
+            ),
+          ],
+        ),
       );
 
       if (paths.isEmpty) {

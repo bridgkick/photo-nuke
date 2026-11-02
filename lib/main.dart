@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.h';
 import 'package:photo_manager/photo_manager.dart';
+import 'dart:typed_data';
 
 void main() {
   runApp(const PhotoNukeApp());
@@ -15,7 +16,7 @@ class PhotoNukeApp extends StatelessWidget {
       title: 'PhotoNuke',
       theme: ThemeData.dark().copyWith(
         scaffoldBackgroundColor: const Color(0xFF121212),
-        colorScheme: ColorScheme.dark(
+        colorScheme: const ColorScheme.dark(
           primary: Colors.redAccent,
           secondary: Colors.amber,
         ),
@@ -68,7 +69,7 @@ class _GalleryScreenState extends State<GalleryScreen> {
     final List<AssetPathEntity> albums = await PhotoManager.getAssetPathList(
       type: RequestType.image,
       filterOption: FilterOptionGroup(
-        orders: [const OrderOption(type: OrderByD.createDate, asc: false)],
+        orders: [const OrderOption(type: OrderBy.createDate, asc: false)],
       ),
     );
 

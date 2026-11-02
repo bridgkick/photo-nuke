@@ -35,6 +35,51 @@ class PhotoNukeApp extends StatelessWidget {
   }
 }
 
+class DateRangeAnchor {
+  final int index;
+  final DateTime date;
+
+  DateRangeAnchor({required this.index, required this.date});
+}
+
+String formatDateMonthYear(DateTime date) {
+  const monthNames = [
+    'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+    'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'
+  ];
+  final month = monthNames[date.month - 1];
+  return '$month ${date.year}';
+}
+
+String estimateDateForFraction({
+  required double fraction,
+  required int totalCount,
+  required List<DateRangeAnchor> anchors,
+  required List<DateTime> loadedDates,
+}) {
+  if (anchors.isNotEmpty && totalCount > 0) {
+    final targetIndex = (fraction * (totalCount - 1)).clamp(0, totalCount - 1);
+    DateRangeAnchor closest = anchors.first;
+    int minDiff = (closest.index - targetIndex).abs().toInt();
+
+    for (final anchor in anchors) {
+      final diff = (anchor.index - targetIndex).abs().toInt();
+      if (diff < minDiff) {
+        minDiff = diff;
+        closest = anchor;
+      }
+    }
+    return formatDateMonthYear(closest.date);
+  }
+
+  if (loadedDates.isNotEmpty) {
+    final idx = (fraction * (loadedDates.length - 1)).round().clamp(0, loadedDates.length - 1);
+    return formatDateMonthYear(loadedDates[idx]);
+  }
+
+  return '';
+}
+
 class GalleryNukeScreen extends StatefulWidget {
   const GalleryNukeScreen({super.key});
 
@@ -54,10 +99,25 @@ class _GalleryNukeScreenState extends State<GalleryNukeScreen> {
   AssetPathEntity? _currentPath;
   bool _canManageMedia = true;
 
+  final ScrollController _scrollController = ScrollController();
+  final GlobalKey _scrollAreaKey = GlobalKey();
+  int _totalAssetCount = 0;
+  List<DateRangeAnchor> _dateAnchors = [];
+  bool _isDraggingHandle = false;
+  double _dragPositionFraction = 0.0;
+  String? _hoverDateText;
+  bool _isTeleporting = false;
+
   @override
   void initState() {
     super.initState();
     _requestPermissionAndLoad();
+  }
+
+  @override
+  void dispose() {
+    _scrollController.dispose();
+    super.dispose();
   }
 
   Future<void> _checkMediaManagement() async {
@@ -130,6 +190,7 @@ class _GalleryNukeScreenState extends State<GalleryNukeScreen> {
 
       _currentPath = paths.first;
       _currentPage = 0;
+      final total = await _currentPath!.assetCountAsync;
       final assets = await _currentPath!.getAssetListPaged(
         page: _currentPage,
         size: 80,
@@ -137,11 +198,15 @@ class _GalleryNukeScreenState extends State<GalleryNukeScreen> {
 
       if (mounted) {
         setState(() {
+          _totalAssetCount = total;
           _assets = assets;
-          _hasMore = assets.length >= 80;
+          _hasMore = assets.length < total;
           _isLoading = false;
         });
       }
+
+      // Precalculate date anchors across the collection in background
+      _precalculateDateAnchors();
     } catch (e) {
       if (kDebugMode) {
         print('Error loading assets: $e');
@@ -150,6 +215,147 @@ class _GalleryNukeScreenState extends State<GalleryNukeScreen> {
         setState(() => _isLoading = false);
       }
     }
+  }
+
+  Future<void> _precalculateDateAnchors() async {
+    if (_currentPath == null || _totalAssetCount <= 0) return;
+
+    try {
+      final List<DateRangeAnchor> anchors = [];
+      const int samplePoints = 25;
+      final Set<int> indicesToFetch = {};
+
+      indicesToFetch.add(0);
+      if (_totalAssetCount > 1) {
+        indicesToFetch.add(_totalAssetCount - 1);
+      }
+
+      for (int i = 1; i < samplePoints; i++) {
+        final int targetIndex = (_totalAssetCount * i / samplePoints).round();
+        if (targetIndex >= 0 && targetIndex < _totalAssetCount) {
+          indicesToFetch.add(targetIndex);
+        }
+      }
+
+      final sortedIndices = indicesToFetch.toList()..sort();
+      for (final index in sortedIndices) {
+        final list = await _currentPath!.getAssetListRange(
+          start: index,
+          end: index + 1,
+        );
+        if (list.isNotEmpty) {
+          anchors.add(DateRangeAnchor(index: index, date: list.first.createDateTime));
+        }
+      }
+
+      if (mounted && anchors.isNotEmpty) {
+        setState(() {
+          _dateAnchors = anchors;
+        });
+      }
+    } catch (e) {
+      if (kDebugMode) {
+        print('Error precalculating date anchors: $e');
+      }
+    }
+  }
+
+  String _estimateDateForFraction(double fraction) {
+    return estimateDateForFraction(
+      fraction: fraction,
+      totalCount: _totalAssetCount,
+      anchors: _dateAnchors,
+      loadedDates: _assets.map((a) => a.createDateTime).toList(),
+    );
+  }
+
+  Future<void> _handleTeleport(double fraction) async {
+    if (_totalAssetCount <= 0 && _assets.isEmpty) return;
+    setState(() => _isTeleporting = true);
+
+    try {
+      final total = _totalAssetCount > 0 ? _totalAssetCount : _assets.length;
+      final targetIndex = (fraction * (total - 1)).round().clamp(0, total - 1);
+
+      if (targetIndex >= _assets.length && _currentPath != null) {
+        const batchSize = 80;
+        final targetPage = targetIndex ~/ batchSize;
+        final endItem = (targetPage + 1) * batchSize;
+
+        final newAssets = await _currentPath!.getAssetListRange(
+          start: 0,
+          end: min(endItem, total),
+        );
+
+        if (mounted) {
+          setState(() {
+            _currentPage = targetPage;
+            _assets = newAssets;
+            _hasMore = newAssets.length < total;
+          });
+        }
+      }
+
+      if (!mounted) return;
+
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!_scrollController.hasClients) return;
+
+        final maxScroll = _scrollController.position.maxScrollExtent;
+        final targetScroll = (fraction * maxScroll).clamp(0.0, maxScroll);
+        _scrollController.jumpTo(targetScroll);
+      });
+    } catch (e) {
+      if (kDebugMode) {
+        print('Error during teleport: $e');
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _isTeleporting = false);
+      }
+    }
+  }
+
+  void _onHandlePanStart(DragStartDetails details) {
+    final RenderBox? box = _scrollAreaKey.currentContext?.findRenderObject() as RenderBox?;
+    if (box == null) return;
+
+    final localY = box.globalToLocal(details.globalPosition).dy;
+    final fraction = (localY / box.size.height).clamp(0.0, 1.0);
+    HapticFeedback.selectionClick();
+
+    setState(() {
+      _isDraggingHandle = true;
+      _dragPositionFraction = fraction;
+      _hoverDateText = _estimateDateForFraction(fraction);
+    });
+  }
+
+  void _onHandlePanUpdate(DragUpdateDetails details) {
+    final RenderBox? box = _scrollAreaKey.currentContext?.findRenderObject() as RenderBox?;
+    if (box == null) return;
+
+    final localY = box.globalToLocal(details.globalPosition).dy;
+    final fraction = (localY / box.size.height).clamp(0.0, 1.0);
+    final newDateText = _estimateDateForFraction(fraction);
+
+    if (newDateText != _hoverDateText) {
+      HapticFeedback.selectionClick();
+    }
+
+    setState(() {
+      _dragPositionFraction = fraction;
+      _hoverDateText = newDateText;
+    });
+  }
+
+  void _onHandlePanEnd(DragEndDetails details) {
+    final fraction = _dragPositionFraction;
+    setState(() {
+      _isDraggingHandle = false;
+      _hoverDateText = null;
+    });
+    _handleTeleport(fraction);
   }
 
   Future<void> _loadMoreAssets() async {
@@ -410,32 +616,197 @@ class _GalleryNukeScreenState extends State<GalleryNukeScreen> {
             ),
           ),
         Expanded(
-          child: NotificationListener<ScrollNotification>(
-            onNotification: (scrollInfo) {
-              if (scrollInfo.metrics.pixels >= scrollInfo.metrics.maxScrollExtent - 400) {
-                _loadMoreAssets();
-              }
-              return false;
+          child: LayoutBuilder(
+            builder: (context, constraints) {
+              final double handleTrackHeight = max(10.0, constraints.maxHeight - 48.0);
+              final double handleTop = (handleTrackHeight * _dragPositionFraction).clamp(0.0, handleTrackHeight);
+
+              return Stack(
+                key: _scrollAreaKey,
+                children: [
+                  NotificationListener<ScrollNotification>(
+                    onNotification: (scrollInfo) {
+                      if (!_isDraggingHandle && scrollInfo.metrics.maxScrollExtent > 0) {
+                        final fraction = (scrollInfo.metrics.pixels / scrollInfo.metrics.maxScrollExtent).clamp(0.0, 1.0);
+                        if ((fraction - _dragPositionFraction).abs() > 0.01) {
+                          setState(() {
+                            _dragPositionFraction = fraction;
+                          });
+                        }
+                      }
+                      if (scrollInfo.metrics.pixels >= scrollInfo.metrics.maxScrollExtent - 400) {
+                        _loadMoreAssets();
+                      }
+                      return false;
+                    },
+                    child: GridView.builder(
+                      controller: _scrollController,
+                      padding: const EdgeInsets.only(left: 4, top: 4, bottom: 4, right: 32),
+                      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                        crossAxisCount: 3,
+                        crossAxisSpacing: 4,
+                        mainAxisSpacing: 4,
+                      ),
+                      itemCount: _assets.length,
+                      itemBuilder: (context, index) {
+                        final asset = _assets[index];
+                        final isNuking = _nukingIds.contains(asset.id);
+                        return PhotoThumbnailTile(
+                          key: ValueKey(asset.id),
+                          asset: asset,
+                          isNuking: isNuking,
+                          onTap: () => _nukeAsset(asset),
+                        );
+                      },
+                    ),
+                  ),
+
+                  // Floating teleport date label in middle of screen
+                  if (_isDraggingHandle && _hoverDateText != null)
+                    Center(
+                      child: IgnorePointer(
+                        child: AnimatedOpacity(
+                          opacity: _isDraggingHandle ? 1.0 : 0.0,
+                          duration: const Duration(milliseconds: 150),
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 14),
+                            decoration: BoxDecoration(
+                              color: const Color(0xFF121420).withValues(alpha: 0.92),
+                              borderRadius: BorderRadius.circular(20),
+                              border: Border.all(
+                                color: const Color(0xFF08D9D6),
+                                width: 2,
+                              ),
+                              boxShadow: [
+                                BoxShadow(
+                                  color: const Color(0xFF08D9D6).withValues(alpha: 0.4),
+                                  blurRadius: 24,
+                                  spreadRadius: 2,
+                                ),
+                              ],
+                            ),
+                            child: Column(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                const Text(
+                                  'TELEPORT TO',
+                                  style: TextStyle(
+                                    color: Color(0xFFFF2E63),
+                                    fontSize: 11,
+                                    fontWeight: FontWeight.w900,
+                                    letterSpacing: 2.0,
+                                  ),
+                                ),
+                                const SizedBox(height: 4),
+                                Text(
+                                  _hoverDateText!,
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 22,
+                                    fontWeight: FontWeight.w900,
+                                    letterSpacing: 1.2,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+
+                  // Right-edge scroll handle touch zone & visual slider
+                  Positioned(
+                    right: 0,
+                    top: 0,
+                    bottom: 0,
+                    width: 32,
+                    child: GestureDetector(
+                      behavior: HitTestBehavior.opaque,
+                      onVerticalDragDown: (details) {
+                        _onHandlePanStart(DragStartDetails(globalPosition: details.globalPosition));
+                      },
+                      onVerticalDragStart: _onHandlePanStart,
+                      onVerticalDragUpdate: _onHandlePanUpdate,
+                      onVerticalDragEnd: _onHandlePanEnd,
+                      onVerticalDragCancel: () {
+                        setState(() {
+                          _isDraggingHandle = false;
+                          _hoverDateText = null;
+                        });
+                      },
+                      child: Stack(
+                        children: [
+                          // Subtle track line
+                          Positioned(
+                            right: 4,
+                            top: 12,
+                            bottom: 12,
+                            width: 3,
+                            child: Container(
+                              decoration: BoxDecoration(
+                                color: _isDraggingHandle
+                                    ? const Color(0xFF08D9D6).withValues(alpha: 0.3)
+                                    : Colors.white.withValues(alpha: 0.08),
+                                borderRadius: BorderRadius.circular(2),
+                              ),
+                            ),
+                          ),
+
+                          // Scroll handle pill
+                          Positioned(
+                            top: handleTop,
+                            right: 2,
+                            child: AnimatedContainer(
+                              duration: const Duration(milliseconds: 100),
+                              width: _isDraggingHandle ? 14 : 8,
+                              height: _isDraggingHandle ? 48 : 36,
+                              decoration: BoxDecoration(
+                                color: _isDraggingHandle
+                                    ? const Color(0xFFFF2E63)
+                                    : const Color(0xFF08D9D6).withValues(alpha: 0.8),
+                                borderRadius: BorderRadius.circular(6),
+                                boxShadow: [
+                                  BoxShadow(
+                                    color: (_isDraggingHandle
+                                            ? const Color(0xFFFF2E63)
+                                            : const Color(0xFF08D9D6))
+                                        .withValues(alpha: 0.6),
+                                    blurRadius: _isDraggingHandle ? 10 : 4,
+                                    spreadRadius: _isDraggingHandle ? 1 : 0,
+                                  ),
+                                ],
+                              ),
+                              child: _isDraggingHandle
+                                  ? const Center(
+                                      child: Icon(
+                                        Icons.unfold_more,
+                                        size: 12,
+                                        color: Colors.white,
+                                      ),
+                                    )
+                                  : null,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+
+                  // Loading indicator during jump/teleport
+                  if (_isTeleporting)
+                    Positioned.fill(
+                      child: Container(
+                        color: Colors.black.withValues(alpha: 0.3),
+                        child: const Center(
+                          child: CircularProgressIndicator(
+                            color: Color(0xFF08D9D6),
+                          ),
+                        ),
+                      ),
+                    ),
+                ],
+              );
             },
-            child: GridView.builder(
-              padding: const EdgeInsets.all(4),
-              gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                crossAxisCount: 3,
-                crossAxisSpacing: 4,
-                mainAxisSpacing: 4,
-              ),
-              itemCount: _assets.length,
-              itemBuilder: (context, index) {
-                final asset = _assets[index];
-                final isNuking = _nukingIds.contains(asset.id);
-                return PhotoThumbnailTile(
-                  key: ValueKey(asset.id),
-                  asset: asset,
-                  isNuking: isNuking,
-                  onTap: () => _nukeAsset(asset),
-                );
-              },
-            ),
           ),
         ),
       ],

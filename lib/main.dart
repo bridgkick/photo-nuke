@@ -52,11 +52,30 @@ class _GalleryNukeScreenState extends State<GalleryNukeScreen> {
   bool _hasMore = true;
   bool _isLoadingMore = false;
   AssetPathEntity? _currentPath;
+  bool _canManageMedia = true;
 
   @override
   void initState() {
     super.initState();
     _requestPermissionAndLoad();
+  }
+
+  Future<void> _checkMediaManagement() async {
+    try {
+      final canManage = await PhotoManager.canManageMedia();
+      if (mounted) {
+        setState(() => _canManageMedia = canManage);
+      }
+    } catch (_) {
+      // Non-Android platforms or errors fall back safely
+    }
+  }
+
+  Future<void> _requestManageMedia() async {
+    try {
+      await PhotoManager.requestManageMedia();
+      await _checkMediaManagement();
+    } catch (_) {}
   }
 
   Future<void> _requestPermissionAndLoad() async {
@@ -69,6 +88,7 @@ class _GalleryNukeScreenState extends State<GalleryNukeScreen> {
       setState(() => _permissionState = state);
 
       if (state.isAuth || state.hasAccess) {
+        await _checkMediaManagement();
         await _loadInitialAssets();
       } else {
         setState(() => _isLoading = false);
@@ -342,32 +362,75 @@ class _GalleryNukeScreenState extends State<GalleryNukeScreen> {
       );
     }
 
-    return NotificationListener<ScrollNotification>(
-      onNotification: (scrollInfo) {
-        if (scrollInfo.metrics.pixels >= scrollInfo.metrics.maxScrollExtent - 400) {
-          _loadMoreAssets();
-        }
-        return false;
-      },
-      child: GridView.builder(
-        padding: const EdgeInsets.all(4),
-        gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-          crossAxisCount: 3,
-          crossAxisSpacing: 4,
-          mainAxisSpacing: 4,
+    return Column(
+      children: [
+        if (!_canManageMedia)
+          Container(
+            width: double.infinity,
+            margin: const EdgeInsets.fromLTRB(8, 8, 8, 4),
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+            decoration: BoxDecoration(
+              color: const Color(0xFFFF2E63).withValues(alpha: 0.15),
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: const Color(0xFFFF2E63), width: 1),
+            ),
+            child: Row(
+              children: [
+                const Icon(Icons.flash_on, color: Color(0xFFFF2E63), size: 20),
+                const SizedBox(width: 8),
+                const Expanded(
+                  child: Text(
+                    'Instant delete requires Media Management access to bypass confirmation dialogs.',
+                    style: TextStyle(fontSize: 11, color: Colors.white70),
+                  ),
+                ),
+                const SizedBox(width: 8),
+                TextButton(
+                  style: TextButton.styleFrom(
+                    backgroundColor: const Color(0xFFFF2E63),
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                    visualDensity: VisualDensity.compact,
+                  ),
+                  onPressed: _requestManageMedia,
+                  child: const Text(
+                    'ENABLE',
+                    style: TextStyle(fontSize: 11, fontWeight: FontWeight.bold),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        Expanded(
+          child: NotificationListener<ScrollNotification>(
+            onNotification: (scrollInfo) {
+              if (scrollInfo.metrics.pixels >= scrollInfo.metrics.maxScrollExtent - 400) {
+                _loadMoreAssets();
+              }
+              return false;
+            },
+            child: GridView.builder(
+              padding: const EdgeInsets.all(4),
+              gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                crossAxisCount: 3,
+                crossAxisSpacing: 4,
+                mainAxisSpacing: 4,
+              ),
+              itemCount: _assets.length,
+              itemBuilder: (context, index) {
+                final asset = _assets[index];
+                final isNuking = _nukingIds.contains(asset.id);
+                return PhotoThumbnailTile(
+                  key: ValueKey(asset.id),
+                  asset: asset,
+                  isNuking: isNuking,
+                  onTap: () => _nukeAsset(asset),
+                );
+              },
+            ),
+          ),
         ),
-        itemCount: _assets.length,
-        itemBuilder: (context, index) {
-          final asset = _assets[index];
-          final isNuking = _nukingIds.contains(asset.id);
-          return PhotoThumbnailTile(
-            key: ValueKey(asset.id),
-            asset: asset,
-            isNuking: isNuking,
-            onTap: () => _nukeAsset(asset),
-          );
-        },
-      ),
+      ],
     );
   }
 }

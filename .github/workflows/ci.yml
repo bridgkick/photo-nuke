@@ -46,13 +46,20 @@ jobs:
           name: photonuke-release-apk
           path: build/app/outputs/flutter-apk/app-release.apk
 
-      - name: Update Nightly Release
+      - name: Update rolling release tag
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          git tag -f latest "${{ github.sha }}"
+          git push -f origin refs/tags/latest
+
+      - name: Update Latest Release
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: ncipollo/release-action@v1
         with:
-          tag: nightly
-          name: "PhotoNuke Nightly / Latest Build"
-          body: "Automated nightly release built from the latest commit on main."
+          tag: latest
+          commit: ${{ github.sha }}
+          name: "PhotoNuke Latest Build"
+          body: "Automated rolling release built from the latest commit on main."
           allowUpdates: true
           replacesArtifacts: true
           artifacts: "build/app/outputs/flutter-apk/app-release.apk"

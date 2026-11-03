@@ -257,12 +257,6 @@ void main() {
       final filter = buildGalleryFilterOption();
       if (Platform.isAndroid) {
         expect(filter, isA<CustomFilter>());
-        final custom = filter as CustomFilter;
-        final child = custom.childMap();
-        final orderBy = child['orderBy'] as List;
-        expect(orderBy, isNotEmpty);
-        expect(orderBy.first['column'], 'datetaken');
-        expect(orderBy.first['isAsc'], isFalse);
       } else {
         expect(filter, isA<FilterOptionGroup>());
         final group = filter as FilterOptionGroup;
@@ -270,6 +264,48 @@ void main() {
         expect(group.orders.first.type, OrderOptionType.createDate);
         expect(group.orders.first.asc, isFalse);
       }
+    });
+
+    List<Map> androidOrderBy({int? sdkInt, bool simple = false}) {
+      final filter = buildGalleryFilterOption(
+        isAndroid: true,
+        androidSdkInt: sdkInt,
+        simpleColumnsOnly: simple,
+      );
+      expect(filter, isA<CustomFilter>());
+      return ((filter as CustomFilter).childMap()['orderBy'] as List)
+          .cast<Map>();
+    }
+
+    test('Android 10+ sorts by the same effective date as createDateTime', () {
+      for (final sdk in [null, 29, 34]) {
+        final orderBy = androidOrderBy(sdkInt: sdk);
+        expect(orderBy.map((o) => o['column']).toList(), [
+          androidEffectiveDateSortExpression,
+          '_id',
+        ]);
+        expect(orderBy.every((o) => o['isAsc'] == false), isTrue);
+      }
+      // Photos without DATE_TAKEN must fall back to DATE_ADDED (seconds -> ms)
+      // instead of sorting as NULL at the end of the gallery.
+      expect(androidEffectiveDateSortExpression, contains('datetaken'));
+      expect(androidEffectiveDateSortExpression, contains('date_added * 1000'));
+    });
+
+    test('Android below 10 sorts by date_added like createDateTime', () {
+      final orderBy = androidOrderBy(sdkInt: 28);
+      expect(orderBy.map((o) => o['column']).toList(), ['date_added', '_id']);
+      expect(orderBy.every((o) => o['isAsc'] == false), isTrue);
+    });
+
+    test('Android fallback ordering uses plain columns only', () {
+      final orderBy = androidOrderBy(sdkInt: 33, simple: true);
+      expect(orderBy.map((o) => o['column']).toList(), [
+        'datetaken',
+        'date_added',
+        '_id',
+      ]);
+      expect(orderBy.every((o) => o['isAsc'] == false), isTrue);
     });
 
     test('estimateFirstVisibleGridIndex calculates correct row and item index', () {

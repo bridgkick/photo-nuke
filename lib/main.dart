@@ -87,7 +87,8 @@ class GalleryNukeScreen extends StatefulWidget {
   State<GalleryNukeScreen> createState() => _GalleryNukeScreenState();
 }
 
-class _GalleryNukeScreenState extends State<GalleryNukeScreen> {
+class _GalleryNukeScreenState extends State<GalleryNukeScreen>
+    with WidgetsBindingObserver {
   PermissionState _permissionState = PermissionState.notDetermined;
   bool _isLoading = true;
   List<AssetEntity> _assets = [];
@@ -111,11 +112,20 @@ class _GalleryNukeScreenState extends State<GalleryNukeScreen> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _requestPermissionAndLoad();
   }
 
   @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      _checkMediaManagement();
+    }
+  }
+
+  @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _scrollController.dispose();
     super.dispose();
   }

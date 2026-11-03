@@ -108,6 +108,12 @@ List<T> mergePrefixPreservingTombstones<T>({
 
 DateTime burndownDeadline(DateTime now, Duration duration) => now.add(duration);
 
+DateTime? resetBurndownDeadline({
+  required DateTime now,
+  required DateTime? deadline,
+  required Duration duration,
+}) => deadline == null ? null : burndownDeadline(now, duration);
+
 bool isBurndownReady({
   required DateTime now,
   required DateTime? deadline,
@@ -638,7 +644,14 @@ class _GalleryNukeScreenState extends State<GalleryNukeScreen>
     if (_pendingNukeIds.contains(asset.id)) {
       HapticFeedback.selectionClick();
       _assetGeneration++;
-      setState(() => _pendingNukeIds.remove(asset.id));
+      setState(() {
+        _pendingNukeIds.remove(asset.id);
+        _burndownDeadline = resetBurndownDeadline(
+          now: DateTime.now(),
+          deadline: _burndownDeadline,
+          duration: _nukeCountdownDuration,
+        );
+      });
       return;
     }
 

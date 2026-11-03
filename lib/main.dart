@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 import 'dart:math';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -171,6 +172,107 @@ String estimateDateForFraction({
   }
 
   return '';
+}
+
+/// Builds the gallery sort filter ensuring query sort order matches capture dates.
+///
+/// On Android, `FilterOptionGroup` orders by `DATE_ADDED` whereas `AssetEntity.createDateTime`
+/// reads `DATE_TAKEN` (capture date). If photos were imported, synced, or downloaded,
+/// their `DATE_ADDED` differs from their capture date, causing chronological date jumps.
+/// Using [CustomFilter.sql] with `datetaken DESC` ensures query ordering is consistent
+/// with `createDateTime`.
+PMFilter buildGalleryFilterOption() {
+  if (Platform.isAndroid) {
+    return CustomFilter.sql(
+      where: '',
+      orderBy: const [
+        OrderByItem.desc('datetaken'),
+      ],
+    );
+  }
+
+  return FilterOptionGroup(
+    orders: const [
+      OrderOption(type: OrderOptionType.createDate, asc: false),
+    ],
+  );
+}
+
+/// Estimates the index of the first visible asset item in the 3-column grid
+/// based on the current [scrollOffset] and layout dimensions.
+int estimateFirstVisibleGridIndex({
+  required double scrollOffset,
+  required double gridWidth,
+  int crossAxisCount = 3,
+  double crossAxisSpacing = 4.0,
+  double mainAxisSpacing = 4.0,
+  double paddingTop = 4.0,
+  double paddingLeft = 4.0,
+  double paddingRight = 32.0,
+}) {
+  final usableWidth = gridWidth - paddingLeft - paddingRight;
+  if (usableWidth <= 0) return 0;
+  final totalSpacing = (crossAxisCount - 1) * crossAxisSpacing;
+  final itemWidth = (usableWidth - totalSpacing) / crossAxisCount;
+  if (itemWidth <= 0) return 0;
+  final rowHeight = itemWidth;
+  final rowStep = rowHeight + mainAxisSpacing;
+
+  final effectiveOffset = (scrollOffset - paddingTop).clamp(0.0, double.infinity);
+  final rowIndex = (effectiveOffset / rowStep).floor();
+  return rowIndex * crossAxisCount;
+}
+
+/// Calculates the normalized scroll fraction (0.0 to 1.0) scaled relative to
+/// the collection's [totalCount] rather than currently loaded batch size.
+double calculateGalleryScrollFraction({
+  required double scrollOffset,
+  required double gridWidth,
+  required int totalCount,
+  int crossAxisCount = 3,
+  double crossAxisSpacing = 4.0,
+  double mainAxisSpacing = 4.0,
+  double paddingTop = 4.0,
+  double paddingLeft = 4.0,
+  double paddingRight = 32.0,
+}) {
+  if (totalCount <= 1) return 0.0;
+  final firstVisibleIndex = estimateFirstVisibleGridIndex(
+    scrollOffset: scrollOffset,
+    gridWidth: gridWidth,
+    crossAxisCount: crossAxisCount,
+    crossAxisSpacing: crossAxisSpacing,
+    mainAxisSpacing: mainAxisSpacing,
+    paddingTop: paddingTop,
+    paddingLeft: paddingLeft,
+    paddingRight: paddingRight,
+  );
+  return (firstVisibleIndex / (totalCount - 1)).clamp(0.0, 1.0);
+}
+
+/// Calculates the target scroll offset when teleporting to [targetIndex] in the grid.
+double calculateTargetGridScrollOffset({
+  required int targetIndex,
+  required double gridWidth,
+  required double maxScrollExtent,
+  int crossAxisCount = 3,
+  double crossAxisSpacing = 4.0,
+  double mainAxisSpacing = 4.0,
+  double paddingTop = 4.0,
+  double paddingLeft = 4.0,
+  double paddingRight = 32.0,
+}) {
+  final usableWidth = gridWidth - paddingLeft - paddingRight;
+  if (usableWidth <= 0) return 0.0;
+  final totalSpacing = (crossAxisCount - 1) * crossAxisSpacing;
+  final itemWidth = (usableWidth - totalSpacing) / crossAxisCount;
+  if (itemWidth <= 0) return 0.0;
+  final rowHeight = itemWidth;
+  final rowStep = rowHeight + mainAxisSpacing;
+
+  final targetRow = targetIndex ~/ crossAxisCount;
+  final targetOffset = paddingTop + (targetRow * rowStep);
+  return targetOffset.clamp(0.0, maxScrollExtent);
 }
 
 class GalleryNukeScreen extends StatefulWidget {
@@ -399,11 +501,7 @@ class _GalleryNukeScreenState extends State<GalleryNukeScreen>
       final paths = await PhotoManager.getAssetPathList(
         type: RequestType.image,
         onlyAll: true,
-        filterOption: FilterOptionGroup(
-          orders: [
-            const OrderOption(type: OrderOptionType.createDate, asc: false),
-          ],
-        ),
+        filterOption: buildGalleryFilterOption(),
       );
 
       if (paths.isEmpty) {
@@ -547,8 +645,15 @@ class _GalleryNukeScreenState extends State<GalleryNukeScreen>
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!_scrollController.hasClients) return;
 
+        final RenderBox? box =
+            _scrollAreaKey.currentContext?.findRenderObject() as RenderBox?;
+        final gridWidth = box?.size.width ?? 360.0;
         final maxScroll = _scrollController.position.maxScrollExtent;
-        final targetScroll = (fraction * maxScroll).clamp(0.0, maxScroll);
+        final targetScroll = calculateTargetGridScrollOffset(
+          targetIndex: targetIndex,
+          gridWidth: gridWidth,
+          maxScrollExtent: maxScroll,
+        );
         _scrollController.jumpTo(targetScroll);
       });
     } catch (e) {
@@ -951,12 +1056,19 @@ class _GalleryNukeScreenState extends State<GalleryNukeScreen>
                 children: [
                   NotificationListener<ScrollNotification>(
                     onNotification: (scrollInfo) {
-                      if (!_isDraggingHandle &&
-                          scrollInfo.metrics.maxScrollExtent > 0) {
-                        final fraction = (scrollInfo.metrics.pixels /
-                                scrollInfo.metrics.maxScrollExtent)
-                            .clamp(0.0, 1.0);
-                        if ((fraction - _dragPositionFraction).abs() > 0.01) {
+                      if (!_isDraggingHandle) {
+                        final RenderBox? box =
+                            _scrollAreaKey.currentContext?.findRenderObject()
+                                as RenderBox?;
+                        final gridWidth = box?.size.width ?? constraints.maxWidth;
+                        final fraction = calculateGalleryScrollFraction(
+                          scrollOffset: scrollInfo.metrics.pixels,
+                          gridWidth: gridWidth,
+                          totalCount: _totalAssetCount > 0
+                              ? _totalAssetCount
+                              : _assets.length,
+                        );
+                        if ((fraction - _dragPositionFraction).abs() > 0.005) {
                           setState(() {
                             _dragPositionFraction = fraction;
                           });

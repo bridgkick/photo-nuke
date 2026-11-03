@@ -1,8 +1,158 @@
+import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:photonuke/main.dart';
+import 'package:photo_manager/photo_manager.dart';
+
+AssetEntity testAsset(String id, {int day = 1}) => AssetEntity(
+  id: id,
+  typeInt: AssetType.image.index,
+  width: 100,
+  height: 100,
+  createDateSecond: DateTime(2026, 11, day).millisecondsSinceEpoch ~/ 1000,
+);
 
 void main() {
-  testWidgets('PhotoNukeApp renders gallery screen smoke test', (WidgetTester tester) async {
+  test('pagination reloads a prefix instead of using stale page offsets', () {
+    final pagination = GalleryPagination(pageSize: 3)
+      ..reset(total: 8, loaded: 3);
+    expect(pagination.nextPrefixEnd, 6);
+
+    // One item before the unloaded page was deleted. The provider now has
+    // seven rows, and the next request must still begin at zero.
+    pagination.applyDeletionCount(1);
+    expect(pagination.totalCount, 7);
+    expect(pagination.nextPrefixEnd, 6);
+    expect(pagination.hasMore, isTrue);
+  });
+
+  test(
+    'prefix merge preserves active tombstone slots and does not duplicate ids',
+    () {
+      final current = [testAsset('a'), testAsset('b'), testAsset('c')];
+      final fetched = [testAsset('b'), testAsset('c'), testAsset('d')];
+      final merged = mergePrefixPreservingTombstones(
+        current: current,
+        fetched: fetched,
+        stableIds: {'a'},
+        idOf: (asset) => asset.id,
+      );
+      expect(merged.map((asset) => asset.id), ['a', 'b', 'c', 'd']);
+    },
+  );
+
+  test('burndown deadline resets and waits for active nukes', () {
+    final start = DateTime(2026, 11, 2, 19, 0);
+    final first = burndownDeadline(start, const Duration(seconds: 3));
+    final second = burndownDeadline(
+      start.add(const Duration(seconds: 1)),
+      const Duration(seconds: 3),
+    );
+    expect(second, start.add(const Duration(seconds: 4)));
+    expect(
+      isBurndownReady(
+        now: first.add(const Duration(seconds: 1)),
+        deadline: first,
+        hasActiveNuke: true,
+      ),
+      isFalse,
+    );
+    expect(
+      isBurndownReady(
+        now: first.add(const Duration(seconds: 1)),
+        deadline: first,
+        hasActiveNuke: false,
+      ),
+      isTrue,
+    );
+  });
+
+  testWidgets('countdown renders, second tap cancels, and tombstone renders', (
+    tester,
+  ) async {
+    var completed = 0;
+    final asset = testAsset('countdown');
+    var pending = true;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SizedBox(
+            width: 160,
+            height: 160,
+            child: StatefulBuilder(
+              builder: (context, setState) {
+                return PhotoThumbnailTile(
+                  asset: asset,
+                  isPending: pending,
+                  isDeleting: false,
+                  isDeleted: false,
+                  onTap: () => setState(() => pending = false),
+                  onCountdownComplete: () => completed++,
+                );
+              },
+            ),
+          ),
+        ),
+      ),
+    );
+    expect(find.byKey(const ValueKey('nuke-countdown')), findsOneWidget);
+    await tester.pump(const Duration(seconds: 2));
+    expect(completed, 0);
+
+    // A second tap cancels a fresh countdown before its deadline.
+    pending = true;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SizedBox(
+            width: 160,
+            height: 160,
+            child: StatefulBuilder(
+              builder: (context, setState) {
+                return PhotoThumbnailTile(
+                  asset: asset,
+                  isPending: pending,
+                  isDeleting: false,
+                  isDeleted: false,
+                  onTap: () => setState(() => pending = false),
+                  onCountdownComplete: () => completed++,
+                );
+              },
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.tap(find.byType(PhotoThumbnailTile));
+    await tester.pump();
+    expect(find.byKey(const ValueKey('nuke-countdown')), findsNothing);
+    await tester.pump(const Duration(seconds: 3));
+    expect(completed, 0);
+
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: SizedBox(
+            width: 160,
+            height: 160,
+            child: PhotoThumbnailTile(
+              asset: asset,
+              isPending: false,
+              isDeleting: false,
+              isDeleted: true,
+              onTap: () {},
+              onCountdownComplete: () {},
+            ),
+          ),
+        ),
+      ),
+    );
+    await tester.pump();
+    expect(find.byKey(const ValueKey('deleted-tombstone')), findsOneWidget);
+  });
+
+  testWidgets('PhotoNukeApp renders gallery screen smoke test', (
+    WidgetTester tester,
+  ) async {
     await tester.pumpWidget(const PhotoNukeApp());
 
     // Verify app title and header bar exist

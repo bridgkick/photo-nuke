@@ -45,6 +45,77 @@ class DateRangeAnchor {
   DateRangeAnchor({required this.index, required this.date});
 }
 
+/// Keeps pagination offsets relative to the current media-store snapshot.
+///
+/// A page number is not stable after an item before that page is deleted.  The
+/// gallery therefore always reloads a longer prefix (starting at zero) when
+/// it asks for the next batch.  This small value object keeps that invariant
+/// explicit and makes it difficult for a deletion to make us skip an item.
+class GalleryPagination {
+  GalleryPagination({this.pageSize = 80});
+
+  final int pageSize;
+  int totalCount = 0;
+  int loadedSourceCount = 0;
+
+  bool get hasMore => loadedSourceCount < totalCount;
+
+  void reset({required int total, required int loaded}) {
+    totalCount = max(0, total);
+    loadedSourceCount = loaded.clamp(0, totalCount).toInt();
+  }
+
+  /// The end offset for the next prefix request.  The start is always zero.
+  int get nextPrefixEnd => min(totalCount, loadedSourceCount + pageSize);
+
+  void applySnapshot({required int total, required int loaded}) {
+    totalCount = max(0, total);
+    loadedSourceCount = loaded.clamp(0, totalCount).toInt();
+  }
+
+  void applyDeletionCount(int count) {
+    totalCount = max(0, totalCount - count);
+    loadedSourceCount = min(loadedSourceCount, totalCount);
+  }
+}
+
+/// Merge a fresh media-store prefix into the visible list without moving an
+/// active tombstone/deletion slot. MediaStore offset pages shift immediately
+/// after a deletion, so the visible list must be rebuilt from a prefix rather
+/// than appended from a stale page number.
+List<T> mergePrefixPreservingTombstones<T>({
+  required List<T> fetched,
+  required List<T> current,
+  required Set<String> stableIds,
+  required String Function(T item) idOf,
+}) {
+  final available = fetched.where((item) => !stableIds.contains(idOf(item)));
+  final iterator = available.iterator;
+  final merged = <T>[];
+
+  for (final item in current) {
+    if (stableIds.contains(idOf(item))) {
+      merged.add(item);
+    } else if (iterator.moveNext()) {
+      merged.add(iterator.current);
+    } else {
+      break;
+    }
+  }
+  while (iterator.moveNext()) {
+    merged.add(iterator.current);
+  }
+  return merged;
+}
+
+DateTime burndownDeadline(DateTime now, Duration duration) => now.add(duration);
+
+bool isBurndownReady({
+  required DateTime now,
+  required DateTime? deadline,
+  required bool hasActiveNuke,
+}) => deadline != null && !now.isBefore(deadline) && !hasActiveNuke;
+
 String formatDateMonthYear(DateTime date) {
   const monthNames = [
     'Jan',
@@ -122,15 +193,16 @@ class _GalleryNukeScreenState extends State<GalleryNukeScreen>
   Timer? _burndownTicker;
   DateTime? _burndownDeadline;
   int _nukedCount = 0;
-  int _currentPage = 0;
   bool _hasMore = true;
   bool _isLoadingMore = false;
   AssetPathEntity? _currentPath;
+  final GalleryPagination _pagination = GalleryPagination();
   bool _canManageMedia = true;
 
   final ScrollController _scrollController = ScrollController();
   final GlobalKey _scrollAreaKey = GlobalKey();
   int _totalAssetCount = 0;
+  int _assetGeneration = 0;
   List<DateRangeAnchor> _dateAnchors = [];
   bool _isDraggingHandle = false;
   double _dragPositionFraction = 0.0;
@@ -173,14 +245,21 @@ class _GalleryNukeScreenState extends State<GalleryNukeScreen>
       _pendingNukeIds.isNotEmpty || _deletingIds.isNotEmpty;
 
   void _startBurndown() {
-    _burndownDeadline = DateTime.now().add(_nukeCountdownDuration);
+    _burndownDeadline = burndownDeadline(
+      DateTime.now(),
+      _nukeCountdownDuration,
+    );
     _burndownTicker ??= Timer.periodic(const Duration(milliseconds: 50), (_) {
       if (!mounted) return;
 
       final deadline = _burndownDeadline;
       if (deadline == null) return;
 
-      if (DateTime.now().isBefore(deadline)) {
+      if (!isBurndownReady(
+        now: DateTime.now(),
+        deadline: deadline,
+        hasActiveNuke: _hasActiveNuke,
+      )) {
         setState(() {});
         return;
       }
@@ -203,14 +282,67 @@ class _GalleryNukeScreenState extends State<GalleryNukeScreen>
   void _reflowDeletedAssets() {
     if (_deletedIds.isEmpty) return;
 
+    // Keep the old prefix length before reducing the count. If an item from
+    // the loaded prefix was deleted, the next item shifts into its slot and
+    // must be fetched before we decide that pagination is complete.
+    final prefixEndBeforeDeletion = _pagination.loadedSourceCount;
     final removedCount =
         _assets.where((asset) => _deletedIds.contains(asset.id)).length;
     setState(() {
       _assets.removeWhere((asset) => _deletedIds.contains(asset.id));
       _deletedIds.clear();
-      _totalAssetCount = max(0, _totalAssetCount - removedCount);
-      _hasMore = _assets.length < _totalAssetCount;
+      _assetGeneration++;
+      _pagination.applyDeletionCount(removedCount);
+      _totalAssetCount = _pagination.totalCount;
+      _hasMore = _pagination.hasMore;
+      _dateAnchors = [];
     });
+    unawaited(
+      _refreshLoadedPrefix(end: prefixEndBeforeDeletion).whenComplete(() {
+        unawaited(_precalculateDateAnchors());
+      }),
+    );
+  }
+
+  Future<void> _refreshLoadedPrefix({int? end}) async {
+    final path = _currentPath;
+    if (path == null || _assets.isEmpty || _pagination.totalCount <= 0) {
+      return;
+    }
+
+    final generation = _assetGeneration;
+    final stableIds = {..._deletedIds, ..._deletingIds};
+    final requestedEnd = min(
+      _pagination.totalCount,
+      max(end ?? _assets.length, _assets.length),
+    );
+
+    try {
+      final fetched = await path.getAssetListRange(start: 0, end: requestedEnd);
+      if (!mounted || generation != _assetGeneration || path != _currentPath) {
+        return;
+      }
+
+      final refreshed = mergePrefixPreservingTombstones(
+        fetched: fetched,
+        current: _assets,
+        stableIds: stableIds,
+        idOf: (asset) => asset.id,
+      );
+      setState(() {
+        _assets = refreshed;
+        _pagination.applySnapshot(
+          total: _pagination.totalCount,
+          loaded:
+              fetched.where((asset) => !stableIds.contains(asset.id)).length,
+        );
+        _hasMore = _pagination.hasMore;
+      });
+    } catch (e) {
+      if (kDebugMode) {
+        print('Error refreshing gallery prefix: $e');
+      }
+    }
   }
 
   Future<void> _checkMediaManagement() async {
@@ -279,18 +411,16 @@ class _GalleryNukeScreenState extends State<GalleryNukeScreen>
       }
 
       _currentPath = paths.first;
-      _currentPage = 0;
+      _assetGeneration++;
       final total = await _currentPath!.assetCountAsync;
-      final assets = await _currentPath!.getAssetListPaged(
-        page: _currentPage,
-        size: 80,
-      );
+      final assets = await _currentPath!.getAssetListPaged(page: 0, size: 80);
 
       if (mounted) {
         setState(() {
           _totalAssetCount = total;
           _assets = assets;
-          _hasMore = assets.length < total;
+          _pagination.reset(total: total, loaded: assets.length);
+          _hasMore = _pagination.hasMore;
           _isLoading = false;
         });
       }
@@ -310,6 +440,9 @@ class _GalleryNukeScreenState extends State<GalleryNukeScreen>
 
   Future<void> _precalculateDateAnchors() async {
     if (_currentPath == null || _totalAssetCount <= 0) return;
+    final path = _currentPath!;
+    final generation = _assetGeneration;
+    final totalCount = _totalAssetCount;
 
     try {
       final List<DateRangeAnchor> anchors = [];
@@ -330,10 +463,7 @@ class _GalleryNukeScreenState extends State<GalleryNukeScreen>
 
       final sortedIndices = indicesToFetch.toList()..sort();
       for (final index in sortedIndices) {
-        final list = await _currentPath!.getAssetListRange(
-          start: index,
-          end: index + 1,
-        );
+        final list = await path.getAssetListRange(start: index, end: index + 1);
         if (list.isNotEmpty) {
           anchors.add(
             DateRangeAnchor(index: index, date: list.first.createDateTime),
@@ -341,7 +471,11 @@ class _GalleryNukeScreenState extends State<GalleryNukeScreen>
         }
       }
 
-      if (mounted && anchors.isNotEmpty) {
+      if (mounted &&
+          anchors.isNotEmpty &&
+          generation == _assetGeneration &&
+          path == _currentPath &&
+          totalCount == _totalAssetCount) {
         setState(() {
           _dateAnchors = anchors;
         });
@@ -365,26 +499,39 @@ class _GalleryNukeScreenState extends State<GalleryNukeScreen>
   Future<void> _handleTeleport(double fraction) async {
     if (_totalAssetCount <= 0 && _assets.isEmpty) return;
     setState(() => _isTeleporting = true);
+    final generation = _assetGeneration;
+    final path = _currentPath;
 
     try {
       final total = _totalAssetCount > 0 ? _totalAssetCount : _assets.length;
       final targetIndex = (fraction * (total - 1)).round().clamp(0, total - 1);
 
-      if (targetIndex >= _assets.length && _currentPath != null) {
-        const batchSize = 80;
-        final targetPage = targetIndex ~/ batchSize;
-        final endItem = (targetPage + 1) * batchSize;
-
-        final newAssets = await _currentPath!.getAssetListRange(
-          start: 0,
-          end: min(endItem, total),
+      if (targetIndex >= _assets.length && path != null) {
+        final endItem = min(
+          total,
+          max(targetIndex + 1, _pagination.loadedSourceCount),
         );
 
-        if (mounted) {
+        final fetched = await path.getAssetListRange(start: 0, end: endItem);
+
+        if (mounted && generation == _assetGeneration && path == _currentPath) {
+          final stableIds = {..._deletedIds, ..._deletingIds};
+          final newAssets = mergePrefixPreservingTombstones(
+            fetched: fetched,
+            current: _assets,
+            stableIds: stableIds,
+            idOf: (asset) => asset.id,
+          );
           setState(() {
-            _currentPage = targetPage;
             _assets = newAssets;
-            _hasMore = newAssets.length < total;
+            _pagination.applySnapshot(
+              total: total,
+              loaded:
+                  fetched
+                      .where((asset) => !stableIds.contains(asset.id))
+                      .length,
+            );
+            _hasMore = _pagination.hasMore;
           });
         }
       }
@@ -456,19 +603,31 @@ class _GalleryNukeScreenState extends State<GalleryNukeScreen>
   Future<void> _loadMoreAssets() async {
     if (_isLoadingMore || !_hasMore || _currentPath == null) return;
     _isLoadingMore = true;
+    final generation = _assetGeneration;
+    final path = _currentPath!;
 
     try {
-      final nextPage = _currentPage + 1;
-      final newAssets = await _currentPath!.getAssetListPaged(
-        page: nextPage,
-        size: 80,
-      );
+      // Never request a later offset page from the old snapshot. Deleting an
+      // earlier item shifts every later page and would otherwise skip assets.
+      final end = _pagination.nextPrefixEnd;
+      final fetched = await path.getAssetListRange(start: 0, end: end);
 
-      if (mounted) {
+      if (mounted && generation == _assetGeneration && path == _currentPath) {
+        final stableIds = {..._deletedIds, ..._deletingIds};
+        final newAssets = mergePrefixPreservingTombstones(
+          fetched: fetched,
+          current: _assets,
+          stableIds: stableIds,
+          idOf: (asset) => asset.id,
+        );
         setState(() {
-          _currentPage = nextPage;
-          _assets.addAll(newAssets);
-          _hasMore = newAssets.length >= 80;
+          _assets = newAssets;
+          _pagination.applySnapshot(
+            total: _totalAssetCount,
+            loaded:
+                fetched.where((asset) => !stableIds.contains(asset.id)).length,
+          );
+          _hasMore = _pagination.hasMore;
         });
       }
     } finally {
@@ -483,6 +642,7 @@ class _GalleryNukeScreenState extends State<GalleryNukeScreen>
 
     if (_pendingNukeIds.contains(asset.id)) {
       HapticFeedback.selectionClick();
+      _assetGeneration++;
       setState(() => _pendingNukeIds.remove(asset.id));
       return;
     }
@@ -498,6 +658,9 @@ class _GalleryNukeScreenState extends State<GalleryNukeScreen>
 
     // Trigger the impact only when the countdown actually reaches zero.
     HapticFeedback.heavyImpact();
+    // Invalidate any in-flight telemetry/teleport merge. Otherwise a fetch
+    // started just before this delete could replace the new tombstone slot.
+    _assetGeneration++;
     setState(() => _deletingIds.add(asset.id));
 
     try {
@@ -1019,7 +1182,7 @@ class PhotoThumbnailTile extends StatefulWidget {
 }
 
 class _PhotoThumbnailTileState extends State<PhotoThumbnailTile>
-    with SingleTickerProviderStateMixin {
+    with TickerProviderStateMixin {
   late final AnimationController _countdownController;
   late final AnimationController _shatterController;
   late final Animation<double> _scaleAnimation;
@@ -1137,6 +1300,10 @@ class _PhotoThumbnailTileState extends State<PhotoThumbnailTile>
                       borderRadius: BorderRadius.circular(6),
                     ),
                     clipBehavior: Clip.antiAlias,
+                    key:
+                        widget.isDeleted
+                            ? const ValueKey('deleted-tombstone')
+                            : null,
                     child:
                         widget.isDeleted
                             ? const SizedBox.expand()
@@ -1166,6 +1333,7 @@ class _PhotoThumbnailTileState extends State<PhotoThumbnailTile>
                   ),
                   if (widget.isPending)
                     Container(
+                      key: const ValueKey('nuke-countdown'),
                       color: Colors.black.withValues(alpha: 0.55),
                       child: Center(
                         child: SizedBox(

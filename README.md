@@ -16,3 +16,13 @@ Candy Crush for gallery purging. A high-velocity, highly addictive Android galle
 ## Architecture
 - **Framework:** Flutter (Dart) for 60fps gesture handling and custom canvas effects.
 - **Storage & Privacy:** 100% offline and local-first via Android MediaStore.
+
+## Android release builds
+Release APKs are signed with a persistent Android keystore so they can be installed as updates. Configure these GitHub Actions repository secrets:
+
+- `ANDROID_KEYSTORE_BASE64`: the keystore file encoded as base64
+- `ANDROID_KEYSTORE_PASSWORD`: the keystore password
+- `ANDROID_KEY_ALIAS`: the signing key alias
+- `ANDROID_KEY_PASSWORD`: the signing key password
+
+Keep the keystore and its passwords safe and reuse them for every release. The workflow increases the Android version code for each release build.

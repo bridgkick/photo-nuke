@@ -1,3 +1,4 @@
+import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:photonuke/main.dart';
@@ -248,6 +249,167 @@ void main() {
         loadedDates: dates,
       );
       expect(bottomDate, 'Aug 2026');
+    });
+  });
+
+  group('Issue #16 date sorting and teleport scroll tests', () {
+    test('buildGalleryFilterOption configures correct sort column by platform', () {
+      final filter = buildGalleryFilterOption();
+      if (Platform.isAndroid) {
+        expect(filter, isA<CustomFilter>());
+        final custom = filter as CustomFilter;
+        final child = custom.childMap();
+        final orderBy = child['orderBy'] as List;
+        expect(orderBy, isNotEmpty);
+        expect(orderBy.first['column'], 'datetaken');
+        expect(orderBy.first['isAsc'], isFalse);
+      } else {
+        expect(filter, isA<FilterOptionGroup>());
+        final group = filter as FilterOptionGroup;
+        expect(group.orders, isNotEmpty);
+        expect(group.orders.first.type, OrderOptionType.createDate);
+        expect(group.orders.first.asc, isFalse);
+      }
+    });
+
+    test('estimateFirstVisibleGridIndex calculates correct row and item index', () {
+      // 360 width, paddingLeft 4, paddingRight 32 -> usableWidth = 324
+      // 3 columns, spacing = 4 -> itemWidth = (324 - 8) / 3 = 105.333
+      // rowStep = 105.333 + 4 = 109.333
+      // Offset 0 -> item 0
+      expect(estimateFirstVisibleGridIndex(scrollOffset: 0, gridWidth: 360), 0);
+
+      // Offset 115 (past row 0) -> row 1 -> item 3
+      expect(estimateFirstVisibleGridIndex(scrollOffset: 115, gridWidth: 360), 3);
+
+      // Offset 555 (past row 4) -> row 5 -> item 15
+      expect(estimateFirstVisibleGridIndex(scrollOffset: 555, gridWidth: 360), 15);
+
+      // Negative offset clamped to 0
+      expect(estimateFirstVisibleGridIndex(scrollOffset: -50, gridWidth: 360), 0);
+    });
+
+    test('calculateGalleryScrollFraction scales by totalCount not batch size', () {
+      // Library with 1001 items, currently scrolled to row 5 (item 15)
+      final fraction = calculateGalleryScrollFraction(
+        scrollOffset: 555,
+        gridWidth: 360,
+        totalCount: 1001,
+      );
+
+      // Fraction is item 15 / 1000 = 0.015, NOT 15 / 79 (~0.19)
+      expect(fraction, closeTo(0.015, 0.001));
+
+      // At top (offset 0)
+      expect(
+        calculateGalleryScrollFraction(
+          scrollOffset: 0,
+          gridWidth: 360,
+          totalCount: 1001,
+        ),
+        0.0,
+      );
+
+      // Empty or 1 item collection returns 0.0 safely
+      expect(
+        calculateGalleryScrollFraction(
+          scrollOffset: 100,
+          gridWidth: 360,
+          totalCount: 0,
+        ),
+        0.0,
+      );
+      expect(
+        calculateGalleryScrollFraction(
+          scrollOffset: 100,
+          gridWidth: 360,
+          totalCount: 1,
+        ),
+        0.0,
+      );
+    });
+
+    test('calculateTargetGridScrollOffset computes accurate scroll position', () {
+      // Row 0 starts at paddingTop = 4.0
+      expect(
+        calculateTargetGridScrollOffset(
+          targetIndex: 0,
+          gridWidth: 360,
+          maxScrollExtent: 2000,
+        ),
+        4.0,
+      );
+
+      // Item 15 is row 5: 4 + 5 * 109.333333 = 550.666666
+      expect(
+        calculateTargetGridScrollOffset(
+          targetIndex: 15,
+          gridWidth: 360,
+          maxScrollExtent: 2000,
+        ),
+        closeTo(550.67, 0.1),
+      );
+
+      // Clamped to maxScrollExtent
+      expect(
+        calculateTargetGridScrollOffset(
+          targetIndex: 500,
+          gridWidth: 360,
+          maxScrollExtent: 1000,
+        ),
+        1000.0,
+      );
+    });
+
+    testWidgets('Scroll notification updates dragPositionFraction based on total collection size', (
+      tester,
+    ) async {
+      final controller = ScrollController();
+      double fraction = 0.0;
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: SizedBox(
+              width: 360,
+              height: 600,
+              child: NotificationListener<ScrollNotification>(
+                onNotification: (scrollInfo) {
+                  fraction = calculateGalleryScrollFraction(
+                    scrollOffset: scrollInfo.metrics.pixels,
+                    gridWidth: 360,
+                    totalCount: 2001,
+                  );
+                  return false;
+                },
+                child: GridView.builder(
+                  controller: controller,
+                  padding: const EdgeInsets.only(
+                    left: 4,
+                    top: 4,
+                    bottom: 4,
+                    right: 32,
+                  ),
+                  gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+                    crossAxisCount: 3,
+                    crossAxisSpacing: 4,
+                    mainAxisSpacing: 4,
+                  ),
+                  itemCount: 80,
+                  itemBuilder: (context, index) => Container(key: ValueKey('item_$index')),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+
+      // Scroll to row 5 (offset 555)
+      controller.jumpTo(555);
+      await tester.pump();
+
+      // With totalCount=2001, item 15 should yield fraction ~15/2000 = 0.0075
+      expect(fraction, closeTo(15 / 2000, 0.001));
     });
   });
 }

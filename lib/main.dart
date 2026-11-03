@@ -5,6 +5,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:photo_manager/photo_manager.dart';
 
+import 'thumbnail_cache.dart';
+
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
   runApp(const PhotoNukeApp());
@@ -134,11 +136,13 @@ class _GalleryNukeScreenState extends State<GalleryNukeScreen>
   double _dragPositionFraction = 0.0;
   String? _hoverDateText;
   bool _isTeleporting = false;
+  final ThumbnailCacheService _thumbnailCache = ThumbnailCacheService.instance;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    unawaited(_thumbnailCache.initialize());
     _requestPermissionAndLoad();
   }
 
@@ -291,8 +295,9 @@ class _GalleryNukeScreenState extends State<GalleryNukeScreen>
         });
       }
 
-      // Precalculate date anchors across the collection in background
+      // Precalculate date anchors and fill newest thumbnails in the background.
       _precalculateDateAnchors();
+      _thumbnailCache.startBackgroundFill(_currentPath!, total);
     } catch (e) {
       if (kDebugMode) {
         print('Error loading assets: $e');
@@ -562,6 +567,17 @@ class _GalleryNukeScreenState extends State<GalleryNukeScreen>
           ],
         ),
         actions: [
+          IconButton(
+            tooltip: 'Thumbnail cache settings',
+            icon: const Icon(Icons.settings_outlined),
+            onPressed: () {
+              Navigator.of(context).push(
+                MaterialPageRoute<void>(
+                  builder: (_) => const ThumbnailCacheSettingsScreen(),
+                ),
+              );
+            },
+          ),
           Container(
             margin: const EdgeInsets.only(right: 16),
             padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
@@ -1046,10 +1062,17 @@ class _PhotoThumbnailTileState extends State<PhotoThumbnailTile>
 
   Future<void> _loadThumbnail() async {
     try {
-      final data = await widget.asset.thumbnailDataWithSize(
-        const ThumbnailSize(240, 240),
-        quality: 85,
-      );
+      final cache = ThumbnailCacheService.instance;
+      final cached = await cache.getThumbnail(widget.asset);
+      final data =
+          cached ??
+          await widget.asset.thumbnailDataWithSize(
+            const ThumbnailSize(240, 240),
+            quality: 85,
+          );
+      if (cached == null && data != null) {
+        unawaited(cache.storeThumbnail(widget.asset.id, data));
+      }
       if (mounted) {
         setState(() {
           _thumbData = data;
@@ -1238,5 +1261,137 @@ class ShatterPopPainter extends CustomPainter {
   @override
   bool shouldRepaint(covariant ShatterPopPainter oldDelegate) {
     return oldDelegate.progress != progress;
+  }
+}
+
+class ThumbnailCacheSettingsScreen extends StatefulWidget {
+  const ThumbnailCacheSettingsScreen({super.key});
+
+  @override
+  State<ThumbnailCacheSettingsScreen> createState() =>
+      _ThumbnailCacheSettingsScreenState();
+}
+
+class _ThumbnailCacheSettingsScreenState
+    extends State<ThumbnailCacheSettingsScreen> {
+  final ThumbnailCacheService _cache = ThumbnailCacheService.instance;
+  late double _budgetMb;
+
+  @override
+  void initState() {
+    super.initState();
+    _budgetMb = _cache.snapshot.value.budgetBytes / (1024 * 1024).toDouble();
+    unawaited(_cache.initialize());
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('THUMBNAIL CACHE')),
+      body: ValueListenableBuilder<ThumbnailCacheSnapshot>(
+        valueListenable: _cache.snapshot,
+        builder: (context, snapshot, _) {
+          final usage = formatCacheBytes(snapshot.usedBytes);
+          final budget = formatCacheBytes(snapshot.budgetBytes);
+          final progress =
+              snapshot.fillTotal == 0
+                  ? 0.0
+                  : (snapshot.fillProgress / snapshot.fillTotal).clamp(
+                    0.0,
+                    1.0,
+                  );
+          return ListView(
+            padding: const EdgeInsets.all(20),
+            children: [
+              const Icon(
+                Icons.photo_library_outlined,
+                size: 64,
+                color: Color(0xFF08D9D6),
+              ),
+              const SizedBox(height: 16),
+              const Text(
+                'LOCAL THUMBNAIL CACHE',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  fontSize: 18,
+                  fontWeight: FontWeight.w900,
+                  letterSpacing: 1.2,
+                ),
+              ),
+              const SizedBox(height: 8),
+              const Text(
+                'Small previews are stored only on this device. The background fill starts with your newest photos and works toward the oldest.',
+                textAlign: TextAlign.center,
+                style: TextStyle(color: Colors.white70),
+              ),
+              const SizedBox(height: 28),
+              Text(
+                'CACHE BUDGET  ${_budgetMb.round()} MB',
+                style: const TextStyle(
+                  fontWeight: FontWeight.bold,
+                  color: Color(0xFFFF2E63),
+                ),
+              ),
+              Slider(
+                min: thumbnailCacheMinimumMb.toDouble(),
+                max: thumbnailCacheMaximumMb.toDouble(),
+                divisions: thumbnailCacheMaximumMb - thumbnailCacheMinimumMb,
+                value: _budgetMb.clamp(
+                  thumbnailCacheMinimumMb.toDouble(),
+                  thumbnailCacheMaximumMb.toDouble(),
+                ),
+                label: '${_budgetMb.round()} MB',
+                onChanged: (value) => setState(() => _budgetMb = value),
+                onChangeEnd:
+                    (value) => _cache.setBudgetMegabytes(value.round()),
+              ),
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: const [
+                  Text('10 MB', style: TextStyle(color: Colors.white54)),
+                  Text('100 MB', style: TextStyle(color: Colors.white54)),
+                ],
+              ),
+              const SizedBox(height: 20),
+              LinearProgressIndicator(
+                value: snapshot.usageFraction,
+                minHeight: 8,
+                backgroundColor: const Color(0xFF25283A),
+                valueColor: const AlwaysStoppedAnimation<Color>(
+                  Color(0xFF08D9D6),
+                ),
+              ),
+              const SizedBox(height: 8),
+              Text(
+                '$usage of $budget  •  ${snapshot.cachedFiles} thumbnails',
+                textAlign: TextAlign.center,
+                style: const TextStyle(color: Colors.white70),
+              ),
+              if (snapshot.isFilling) ...[
+                const SizedBox(height: 20),
+                LinearProgressIndicator(
+                  value: progress,
+                  valueColor: const AlwaysStoppedAnimation<Color>(
+                    Color(0xFFFF2E63),
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  'FILLING NEWEST → OLDEST  ${snapshot.fillProgress}/${snapshot.fillTotal}',
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(fontSize: 12, color: Colors.white70),
+                ),
+              ],
+              const SizedBox(height: 28),
+              OutlinedButton.icon(
+                onPressed: snapshot.isFilling ? null : _cache.clear,
+                icon: const Icon(Icons.delete_sweep_outlined),
+                label: const Text('CLEAR THUMBNAIL CACHE'),
+              ),
+            ],
+          );
+        },
+      ),
+    );
   }
 }

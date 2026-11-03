@@ -66,6 +66,28 @@ void main() {
     );
   });
 
+  test('cancelling a nuke resets only an active burndown deadline', () {
+    final now = DateTime(2026, 11, 2, 19, 0, 1);
+    final deadline = now.subtract(const Duration(seconds: 1));
+
+    expect(
+      resetBurndownDeadline(
+        now: now,
+        deadline: deadline,
+        duration: const Duration(seconds: 3),
+      ),
+      now.add(const Duration(seconds: 3)),
+    );
+    expect(
+      resetBurndownDeadline(
+        now: now,
+        deadline: null,
+        duration: const Duration(seconds: 3),
+      ),
+      isNull,
+    );
+  });
+
   testWidgets('countdown renders, second tap cancels, and tombstone renders', (
     tester,
   ) async {

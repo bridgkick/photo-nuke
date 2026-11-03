@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:math';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -44,8 +45,18 @@ class DateRangeAnchor {
 
 String formatDateMonthYear(DateTime date) {
   const monthNames = [
-    'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
-    'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'
+    'Jan',
+    'Feb',
+    'Mar',
+    'Apr',
+    'May',
+    'Jun',
+    'Jul',
+    'Aug',
+    'Sep',
+    'Oct',
+    'Nov',
+    'Dec',
   ];
   final month = monthNames[date.month - 1];
   return '$month ${date.year}';
@@ -73,7 +84,10 @@ String estimateDateForFraction({
   }
 
   if (loadedDates.isNotEmpty) {
-    final idx = (fraction * (loadedDates.length - 1)).round().clamp(0, loadedDates.length - 1);
+    final idx = (fraction * (loadedDates.length - 1)).round().clamp(
+      0,
+      loadedDates.length - 1,
+    );
     return formatDateMonthYear(loadedDates[idx]);
   }
 
@@ -89,10 +103,22 @@ class GalleryNukeScreen extends StatefulWidget {
 
 class _GalleryNukeScreenState extends State<GalleryNukeScreen>
     with WidgetsBindingObserver {
+  static const Duration _nukeCountdownDuration = Duration(seconds: 3);
+
   PermissionState _permissionState = PermissionState.notDetermined;
   bool _isLoading = true;
   List<AssetEntity> _assets = [];
-  final Set<String> _nukingIds = {};
+
+  /// Photos waiting for their three-second countdown to finish.
+  final Set<String> _pendingNukeIds = {};
+
+  /// Photos whose platform deletion request is in flight.
+  final Set<String> _deletingIds = {};
+
+  /// Deleted photos stay in this set until the burndown reflow removes them.
+  final Set<String> _deletedIds = {};
+  Timer? _burndownTicker;
+  DateTime? _burndownDeadline;
   int _nukedCount = 0;
   int _currentPage = 0;
   bool _hasMore = true;
@@ -126,8 +152,61 @@ class _GalleryNukeScreenState extends State<GalleryNukeScreen>
   @override
   void dispose() {
     WidgetsBinding.instance.removeObserver(this);
+    _burndownTicker?.cancel();
     _scrollController.dispose();
     super.dispose();
+  }
+
+  double get _burndownProgress {
+    final deadline = _burndownDeadline;
+    if (deadline == null) return 0.0;
+    return (deadline.difference(DateTime.now()).inMilliseconds /
+            _nukeCountdownDuration.inMilliseconds)
+        .clamp(0.0, 1.0);
+  }
+
+  bool get _hasActiveNuke =>
+      _pendingNukeIds.isNotEmpty || _deletingIds.isNotEmpty;
+
+  void _startBurndown() {
+    _burndownDeadline = DateTime.now().add(_nukeCountdownDuration);
+    _burndownTicker ??= Timer.periodic(const Duration(milliseconds: 50), (_) {
+      if (!mounted) return;
+
+      final deadline = _burndownDeadline;
+      if (deadline == null) return;
+
+      if (DateTime.now().isBefore(deadline)) {
+        setState(() {});
+        return;
+      }
+
+      // Do not reflow while a countdown or a platform delete is still active.
+      // The next completed delete starts a fresh full burndown.
+      if (_hasActiveNuke) {
+        setState(() {});
+        return;
+      }
+
+      _burndownDeadline = null;
+      _burndownTicker?.cancel();
+      _burndownTicker = null;
+      _reflowDeletedAssets();
+    });
+    if (mounted) setState(() {});
+  }
+
+  void _reflowDeletedAssets() {
+    if (_deletedIds.isEmpty) return;
+
+    final removedCount =
+        _assets.where((asset) => _deletedIds.contains(asset.id)).length;
+    setState(() {
+      _assets.removeWhere((asset) => _deletedIds.contains(asset.id));
+      _deletedIds.clear();
+      _totalAssetCount = max(0, _totalAssetCount - removedCount);
+      _hasMore = _assets.length < _totalAssetCount;
+    });
   }
 
   Future<void> _checkMediaManagement() async {
@@ -180,10 +259,7 @@ class _GalleryNukeScreenState extends State<GalleryNukeScreen>
         onlyAll: true,
         filterOption: FilterOptionGroup(
           orders: [
-            const OrderOption(
-              type: OrderOptionType.createDate,
-              asc: false,
-            ),
+            const OrderOption(type: OrderOptionType.createDate, asc: false),
           ],
         ),
       );
@@ -254,7 +330,9 @@ class _GalleryNukeScreenState extends State<GalleryNukeScreen>
           end: index + 1,
         );
         if (list.isNotEmpty) {
-          anchors.add(DateRangeAnchor(index: index, date: list.first.createDateTime));
+          anchors.add(
+            DateRangeAnchor(index: index, date: list.first.createDateTime),
+          );
         }
       }
 
@@ -327,7 +405,8 @@ class _GalleryNukeScreenState extends State<GalleryNukeScreen>
   }
 
   void _onHandlePanStart(DragStartDetails details) {
-    final RenderBox? box = _scrollAreaKey.currentContext?.findRenderObject() as RenderBox?;
+    final RenderBox? box =
+        _scrollAreaKey.currentContext?.findRenderObject() as RenderBox?;
     if (box == null) return;
 
     final localY = box.globalToLocal(details.globalPosition).dy;
@@ -342,7 +421,8 @@ class _GalleryNukeScreenState extends State<GalleryNukeScreen>
   }
 
   void _onHandlePanUpdate(DragUpdateDetails details) {
-    final RenderBox? box = _scrollAreaKey.currentContext?.findRenderObject() as RenderBox?;
+    final RenderBox? box =
+        _scrollAreaKey.currentContext?.findRenderObject() as RenderBox?;
     if (box == null) return;
 
     final localY = box.globalToLocal(details.globalPosition).dy;
@@ -391,34 +471,50 @@ class _GalleryNukeScreenState extends State<GalleryNukeScreen>
     }
   }
 
+  void _toggleNukeCountdown(AssetEntity asset) {
+    if (_deletingIds.contains(asset.id) || _deletedIds.contains(asset.id)) {
+      return;
+    }
+
+    if (_pendingNukeIds.contains(asset.id)) {
+      HapticFeedback.selectionClick();
+      setState(() => _pendingNukeIds.remove(asset.id));
+      return;
+    }
+
+    HapticFeedback.selectionClick();
+    setState(() => _pendingNukeIds.add(asset.id));
+  }
+
   Future<void> _nukeAsset(AssetEntity asset) async {
-    if (_nukingIds.contains(asset.id)) return;
+    if (!_pendingNukeIds.remove(asset.id) || _deletingIds.contains(asset.id)) {
+      return;
+    }
 
-    // Trigger instant haptic burst
+    // Trigger the impact only when the countdown actually reaches zero.
     HapticFeedback.heavyImpact();
-
-    setState(() {
-      _nukingIds.add(asset.id);
-    });
+    setState(() => _deletingIds.add(asset.id));
 
     try {
       // Delete/Trash the asset from the gallery
-      final List<String> result = await PhotoManager.editor.deleteWithIds([asset.id]);
+      final List<String> result = await PhotoManager.editor.deleteWithIds([
+        asset.id,
+      ]);
 
-      // If deletion completed (or on platforms where dialog resolves), remove from UI
+      // Keep a black tombstone in the same grid slot until the burndown reflows.
       if (result.contains(asset.id) || result.isNotEmpty) {
         if (mounted) {
           setState(() {
-            _assets.removeWhere((a) => a.id == asset.id);
+            _deletingIds.remove(asset.id);
+            _deletedIds.add(asset.id);
             _nukedCount++;
           });
+          _startBurndown();
         }
       } else {
         // User cancelled deletion or platform didn't return id
         if (mounted) {
-          setState(() {
-            _nukingIds.remove(asset.id);
-          });
+          setState(() => _deletingIds.remove(asset.id));
         }
       }
     } catch (e) {
@@ -426,9 +522,7 @@ class _GalleryNukeScreenState extends State<GalleryNukeScreen>
         print('Error nuking asset: $e');
       }
       if (mounted) {
-        setState(() {
-          _nukingIds.remove(asset.id);
-        });
+        setState(() => _deletingIds.remove(asset.id));
       }
     }
   }
@@ -479,7 +573,11 @@ class _GalleryNukeScreenState extends State<GalleryNukeScreen>
             child: Row(
               mainAxisSize: MainAxisSize.min,
               children: [
-                const Icon(Icons.local_fire_department, color: Color(0xFF08D9D6), size: 18),
+                const Icon(
+                  Icons.local_fire_department,
+                  color: Color(0xFF08D9D6),
+                  size: 18,
+                ),
                 const SizedBox(width: 4),
                 Text(
                   '$_nukedCount NUKED',
@@ -501,9 +599,7 @@ class _GalleryNukeScreenState extends State<GalleryNukeScreen>
   Widget _buildBody() {
     if (_isLoading) {
       return const Center(
-        child: CircularProgressIndicator(
-          color: Color(0xFFFF2E63),
-        ),
+        child: CircularProgressIndicator(color: Color(0xFFFF2E63)),
       );
     }
 
@@ -539,7 +635,10 @@ class _GalleryNukeScreenState extends State<GalleryNukeScreen>
                 style: ElevatedButton.styleFrom(
                   backgroundColor: const Color(0xFFFF2E63),
                   foregroundColor: Colors.white,
-                  padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 24,
+                    vertical: 12,
+                  ),
                   shape: RoundedRectangleBorder(
                     borderRadius: BorderRadius.circular(24),
                   ),
@@ -566,7 +665,11 @@ class _GalleryNukeScreenState extends State<GalleryNukeScreen>
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Icon(Icons.check_circle_outline, size: 64, color: Color(0xFF08D9D6)),
+            Icon(
+              Icons.check_circle_outline,
+              size: 64,
+              color: Color(0xFF08D9D6),
+            ),
             SizedBox(height: 16),
             Text(
               'ALL TARGETS NEUTRALIZED',
@@ -588,6 +691,18 @@ class _GalleryNukeScreenState extends State<GalleryNukeScreen>
 
     return Column(
       children: [
+        if (_burndownDeadline != null)
+          SizedBox(
+            height: 4,
+            width: double.infinity,
+            child: LinearProgressIndicator(
+              value: _burndownProgress,
+              backgroundColor: const Color(0xFF25283A),
+              valueColor: const AlwaysStoppedAnimation<Color>(
+                Color(0xFFFF2E63),
+              ),
+            ),
+          ),
         if (!_canManageMedia)
           Container(
             width: double.infinity,
@@ -613,7 +728,10 @@ class _GalleryNukeScreenState extends State<GalleryNukeScreen>
                   style: TextButton.styleFrom(
                     backgroundColor: const Color(0xFFFF2E63),
                     foregroundColor: Colors.white,
-                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 10,
+                      vertical: 6,
+                    ),
                     visualDensity: VisualDensity.compact,
                   ),
                   onPressed: _requestManageMedia,
@@ -628,44 +746,64 @@ class _GalleryNukeScreenState extends State<GalleryNukeScreen>
         Expanded(
           child: LayoutBuilder(
             builder: (context, constraints) {
-              final double handleTrackHeight = max(10.0, constraints.maxHeight - 48.0);
-              final double handleTop = (handleTrackHeight * _dragPositionFraction).clamp(0.0, handleTrackHeight);
+              final double handleTrackHeight = max(
+                10.0,
+                constraints.maxHeight - 48.0,
+              );
+              final double handleTop = (handleTrackHeight *
+                      _dragPositionFraction)
+                  .clamp(0.0, handleTrackHeight);
 
               return Stack(
                 key: _scrollAreaKey,
                 children: [
                   NotificationListener<ScrollNotification>(
                     onNotification: (scrollInfo) {
-                      if (!_isDraggingHandle && scrollInfo.metrics.maxScrollExtent > 0) {
-                        final fraction = (scrollInfo.metrics.pixels / scrollInfo.metrics.maxScrollExtent).clamp(0.0, 1.0);
+                      if (!_isDraggingHandle &&
+                          scrollInfo.metrics.maxScrollExtent > 0) {
+                        final fraction = (scrollInfo.metrics.pixels /
+                                scrollInfo.metrics.maxScrollExtent)
+                            .clamp(0.0, 1.0);
                         if ((fraction - _dragPositionFraction).abs() > 0.01) {
                           setState(() {
                             _dragPositionFraction = fraction;
                           });
                         }
                       }
-                      if (scrollInfo.metrics.pixels >= scrollInfo.metrics.maxScrollExtent - 400) {
+                      if (scrollInfo.metrics.pixels >=
+                          scrollInfo.metrics.maxScrollExtent - 400) {
                         _loadMoreAssets();
                       }
                       return false;
                     },
                     child: GridView.builder(
                       controller: _scrollController,
-                      padding: const EdgeInsets.only(left: 4, top: 4, bottom: 4, right: 32),
-                      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
-                        crossAxisCount: 3,
-                        crossAxisSpacing: 4,
-                        mainAxisSpacing: 4,
+                      padding: const EdgeInsets.only(
+                        left: 4,
+                        top: 4,
+                        bottom: 4,
+                        right: 32,
                       ),
+                      gridDelegate:
+                          const SliverGridDelegateWithFixedCrossAxisCount(
+                            crossAxisCount: 3,
+                            crossAxisSpacing: 4,
+                            mainAxisSpacing: 4,
+                          ),
                       itemCount: _assets.length,
                       itemBuilder: (context, index) {
                         final asset = _assets[index];
-                        final isNuking = _nukingIds.contains(asset.id);
+                        final isPending = _pendingNukeIds.contains(asset.id);
+                        final isDeleting = _deletingIds.contains(asset.id);
+                        final isDeleted = _deletedIds.contains(asset.id);
                         return PhotoThumbnailTile(
                           key: ValueKey(asset.id),
                           asset: asset,
-                          isNuking: isNuking,
-                          onTap: () => _nukeAsset(asset),
+                          isPending: isPending,
+                          isDeleting: isDeleting,
+                          isDeleted: isDeleted,
+                          onTap: () => _toggleNukeCountdown(asset),
+                          onCountdownComplete: () => _nukeAsset(asset),
                         );
                       },
                     ),
@@ -679,9 +817,14 @@ class _GalleryNukeScreenState extends State<GalleryNukeScreen>
                           opacity: _isDraggingHandle ? 1.0 : 0.0,
                           duration: const Duration(milliseconds: 150),
                           child: Container(
-                            padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 14),
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 24,
+                              vertical: 14,
+                            ),
                             decoration: BoxDecoration(
-                              color: const Color(0xFF121420).withValues(alpha: 0.92),
+                              color: const Color(
+                                0xFF121420,
+                              ).withValues(alpha: 0.92),
                               borderRadius: BorderRadius.circular(20),
                               border: Border.all(
                                 color: const Color(0xFF08D9D6),
@@ -689,7 +832,9 @@ class _GalleryNukeScreenState extends State<GalleryNukeScreen>
                               ),
                               boxShadow: [
                                 BoxShadow(
-                                  color: const Color(0xFF08D9D6).withValues(alpha: 0.4),
+                                  color: const Color(
+                                    0xFF08D9D6,
+                                  ).withValues(alpha: 0.4),
                                   blurRadius: 24,
                                   spreadRadius: 2,
                                 ),
@@ -733,7 +878,11 @@ class _GalleryNukeScreenState extends State<GalleryNukeScreen>
                     child: GestureDetector(
                       behavior: HitTestBehavior.opaque,
                       onVerticalDragDown: (details) {
-                        _onHandlePanStart(DragStartDetails(globalPosition: details.globalPosition));
+                        _onHandlePanStart(
+                          DragStartDetails(
+                            globalPosition: details.globalPosition,
+                          ),
+                        );
                       },
                       onVerticalDragStart: _onHandlePanStart,
                       onVerticalDragUpdate: _onHandlePanUpdate,
@@ -754,9 +903,12 @@ class _GalleryNukeScreenState extends State<GalleryNukeScreen>
                             width: 3,
                             child: Container(
                               decoration: BoxDecoration(
-                                color: _isDraggingHandle
-                                    ? const Color(0xFF08D9D6).withValues(alpha: 0.3)
-                                    : Colors.white.withValues(alpha: 0.08),
+                                color:
+                                    _isDraggingHandle
+                                        ? const Color(
+                                          0xFF08D9D6,
+                                        ).withValues(alpha: 0.3)
+                                        : Colors.white.withValues(alpha: 0.08),
                                 borderRadius: BorderRadius.circular(2),
                               ),
                             ),
@@ -771,9 +923,12 @@ class _GalleryNukeScreenState extends State<GalleryNukeScreen>
                               width: _isDraggingHandle ? 14 : 8,
                               height: _isDraggingHandle ? 48 : 36,
                               decoration: BoxDecoration(
-                                color: _isDraggingHandle
-                                    ? const Color(0xFFFF2E63)
-                                    : const Color(0xFF08D9D6).withValues(alpha: 0.8),
+                                color:
+                                    _isDraggingHandle
+                                        ? const Color(0xFFFF2E63)
+                                        : const Color(
+                                          0xFF08D9D6,
+                                        ).withValues(alpha: 0.8),
                                 borderRadius: BorderRadius.circular(6),
                                 boxShadow: [
                                   BoxShadow(
@@ -786,15 +941,16 @@ class _GalleryNukeScreenState extends State<GalleryNukeScreen>
                                   ),
                                 ],
                               ),
-                              child: _isDraggingHandle
-                                  ? const Center(
-                                      child: Icon(
-                                        Icons.unfold_more,
-                                        size: 12,
-                                        color: Colors.white,
-                                      ),
-                                    )
-                                  : null,
+                              child:
+                                  _isDraggingHandle
+                                      ? const Center(
+                                        child: Icon(
+                                          Icons.unfold_more,
+                                          size: 12,
+                                          color: Colors.white,
+                                        ),
+                                      )
+                                      : null,
                             ),
                           ),
                         ],
@@ -826,14 +982,20 @@ class _GalleryNukeScreenState extends State<GalleryNukeScreen>
 
 class PhotoThumbnailTile extends StatefulWidget {
   final AssetEntity asset;
-  final bool isNuking;
+  final bool isPending;
+  final bool isDeleting;
+  final bool isDeleted;
   final VoidCallback onTap;
+  final VoidCallback onCountdownComplete;
 
   const PhotoThumbnailTile({
     super.key,
     required this.asset,
-    required this.isNuking,
+    required this.isPending,
+    required this.isDeleting,
+    required this.isDeleted,
     required this.onTap,
+    required this.onCountdownComplete,
   });
 
   @override
@@ -842,6 +1004,7 @@ class PhotoThumbnailTile extends StatefulWidget {
 
 class _PhotoThumbnailTileState extends State<PhotoThumbnailTile>
     with SingleTickerProviderStateMixin {
+  late final AnimationController _countdownController;
   late final AnimationController _shatterController;
   late final Animation<double> _scaleAnimation;
   late final Animation<double> _opacityAnimation;
@@ -851,16 +1014,24 @@ class _PhotoThumbnailTileState extends State<PhotoThumbnailTile>
   @override
   void initState() {
     super.initState();
+    _countdownController = AnimationController(
+      vsync: this,
+      duration: const Duration(seconds: 3),
+    )..addStatusListener((status) {
+      if (status == AnimationStatus.completed && mounted && widget.isPending) {
+        widget.onCountdownComplete();
+      }
+    });
+    if (widget.isPending) {
+      _countdownController.forward();
+    }
     _shatterController = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 320),
     );
 
     _scaleAnimation = Tween<double>(begin: 1.0, end: 1.35).animate(
-      CurvedAnimation(
-        parent: _shatterController,
-        curve: Curves.easeOutBack,
-      ),
+      CurvedAnimation(parent: _shatterController, curve: Curves.easeOutBack),
     );
 
     _opacityAnimation = Tween<double>(begin: 1.0, end: 0.0).animate(
@@ -895,13 +1066,24 @@ class _PhotoThumbnailTileState extends State<PhotoThumbnailTile>
   @override
   void didUpdateWidget(covariant PhotoThumbnailTile oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (widget.isNuking && !oldWidget.isNuking) {
+    if (widget.isPending && !oldWidget.isPending) {
+      _countdownController.forward(from: 0);
+    } else if (!widget.isPending && oldWidget.isPending) {
+      _countdownController.stop();
+      _countdownController.reset();
+    }
+    if (widget.isDeleting && !oldWidget.isDeleting) {
       _shatterController.forward();
+    } else if (!widget.isDeleting &&
+        oldWidget.isDeleting &&
+        !widget.isDeleted) {
+      _shatterController.reset();
     }
   }
 
   @override
   void dispose() {
+    _countdownController.dispose();
     _shatterController.dispose();
     super.dispose();
   }
@@ -909,11 +1091,13 @@ class _PhotoThumbnailTileState extends State<PhotoThumbnailTile>
   @override
   Widget build(BuildContext context) {
     return GestureDetector(
-      onTap: widget.isNuking ? null : widget.onTap,
+      onTap: widget.isDeleting || widget.isDeleted ? null : widget.onTap,
       child: AnimatedBuilder(
-        animation: _shatterController,
+        animation: Listenable.merge([_countdownController, _shatterController]),
         builder: (context, child) {
-          final isAnimating = _shatterController.value > 0;
+          final isAnimating = widget.isDeleting && _shatterController.value > 0;
+          final remainingSeconds =
+              (3 - (_countdownController.value * 3).floor()).clamp(1, 3);
           return Transform.scale(
             scale: isAnimating ? _scaleAnimation.value : 1.0,
             child: Opacity(
@@ -923,32 +1107,71 @@ class _PhotoThumbnailTileState extends State<PhotoThumbnailTile>
                 children: [
                   Container(
                     decoration: BoxDecoration(
-                      color: const Color(0xFF1C1E2B),
+                      color:
+                          widget.isDeleted
+                              ? Colors.black
+                              : const Color(0xFF1C1E2B),
                       borderRadius: BorderRadius.circular(6),
                     ),
                     clipBehavior: Clip.antiAlias,
-                    child: _thumbData != null
-                        ? Image.memory(
-                            _thumbData!,
-                            fit: BoxFit.cover,
-                            gaplessPlayback: true,
-                          )
-                        : (_thumbLoaded
-                            ? const Center(
-                                child: Icon(Icons.broken_image,
-                                    color: Colors.white24),
-                              )
-                            : const Center(
-                                child: SizedBox(
-                                  width: 16,
-                                  height: 16,
-                                  child: CircularProgressIndicator(
-                                    strokeWidth: 2,
-                                    color: Color(0xFFFF2E63),
+                    child:
+                        widget.isDeleted
+                            ? const SizedBox.expand()
+                            : _thumbData != null
+                            ? Image.memory(
+                              _thumbData!,
+                              fit: BoxFit.cover,
+                              gaplessPlayback: true,
+                            )
+                            : (_thumbLoaded
+                                ? const Center(
+                                  child: Icon(
+                                    Icons.broken_image,
+                                    color: Colors.white24,
                                   ),
-                                ),
-                              )),
+                                )
+                                : const Center(
+                                  child: SizedBox(
+                                    width: 16,
+                                    height: 16,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2,
+                                      color: Color(0xFFFF2E63),
+                                    ),
+                                  ),
+                                )),
                   ),
+                  if (widget.isPending)
+                    Container(
+                      color: Colors.black.withValues(alpha: 0.55),
+                      child: Center(
+                        child: SizedBox(
+                          width: 64,
+                          height: 64,
+                          child: Stack(
+                            alignment: Alignment.center,
+                            children: [
+                              CircularProgressIndicator(
+                                value: 1.0 - _countdownController.value,
+                                strokeWidth: 5,
+                                backgroundColor: Colors.white24,
+                                valueColor: const AlwaysStoppedAnimation<Color>(
+                                  Color(0xFFFF2E63),
+                                ),
+                              ),
+                              Text(
+                                '$remainingSeconds',
+                                style: const TextStyle(
+                                  color: Colors.white,
+                                  fontSize: 24,
+                                  fontWeight: FontWeight.w900,
+                                ),
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ),
                   if (isAnimating)
                     CustomPaint(
                       painter: ShatterPopPainter(
@@ -967,8 +1190,10 @@ class _PhotoThumbnailTileState extends State<PhotoThumbnailTile>
 
 class ShatterPopPainter extends CustomPainter {
   final double progress;
-  static final List<double> _randomAngles =
-      List.generate(12, (i) => (i * 2 * pi / 12) + (i % 2 == 0 ? 0.1 : -0.1));
+  static final List<double> _randomAngles = List.generate(
+    12,
+    (i) => (i * 2 * pi / 12) + (i % 2 == 0 ? 0.1 : -0.1),
+  );
 
   ShatterPopPainter({required this.progress});
 
@@ -978,10 +1203,13 @@ class ShatterPopPainter extends CustomPainter {
     final maxDist = size.width * 0.7;
 
     // Flash glow ring
-    final glowPaint = Paint()
-      ..color = const Color(0xFFFF2E63).withValues(alpha: (1.0 - progress).clamp(0.0, 1.0))
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 3 * (1.0 - progress);
+    final glowPaint =
+        Paint()
+          ..color = const Color(
+            0xFFFF2E63,
+          ).withValues(alpha: (1.0 - progress).clamp(0.0, 1.0))
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 3 * (1.0 - progress);
 
     canvas.drawCircle(center, (size.width / 2) * progress, glowPaint);
 
@@ -995,10 +1223,13 @@ class ShatterPopPainter extends CustomPainter {
       );
 
       final particleRadius = (6.0 - progress * 4.0).clamp(1.0, 6.0);
-      final particlePaint = Paint()
-        ..color = (i % 2 == 0 ? const Color(0xFFFF2E63) : const Color(0xFF08D9D6))
-            .withValues(alpha: (1.0 - progress).clamp(0.0, 1.0))
-        ..style = PaintingStyle.fill;
+      final particlePaint =
+          Paint()
+            ..color = (i % 2 == 0
+                    ? const Color(0xFFFF2E63)
+                    : const Color(0xFF08D9D6))
+                .withValues(alpha: (1.0 - progress).clamp(0.0, 1.0))
+            ..style = PaintingStyle.fill;
 
       canvas.drawCircle(particleCenter, particleRadius, particlePaint);
     }

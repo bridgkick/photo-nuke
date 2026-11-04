@@ -18,11 +18,13 @@ Candy Crush for gallery purging. A high-velocity, highly addictive Android galle
 - **Storage & Privacy:** 100% offline and local-first via Android MediaStore.
 
 ## Android release builds
-Release APKs are signed with a persistent Android keystore so they can be installed as updates. Configure these GitHub Actions repository secrets:
+CI builds and publishes release-mode APKs for development. When no Android signing secrets are configured, Gradle signs them with an automatically generated debug keystore. No secrets are required for this mode, but installing a later build may require uninstalling the previous app, which removes its app data.
+
+For consistent signing so builds can be installed as updates, configure all four GitHub Actions repository secrets:
 
 - `ANDROID_KEYSTORE_BASE64`: the keystore file encoded as base64
 - `ANDROID_KEYSTORE_PASSWORD`: the keystore password
 - `ANDROID_KEY_ALIAS`: the signing key alias
 - `ANDROID_KEY_PASSWORD`: the signing key password
 
-Keep the keystore and its passwords safe and reuse them for every release. The workflow increases the Android version code for each release build.
+If only some signing secrets are configured, CI fails rather than silently switching keys. Keep the release keystore and its passwords safe and reuse them for every release. The workflow increases the Android version code for each release build.

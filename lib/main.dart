@@ -172,20 +172,46 @@ String estimateDateForFraction({
   return '';
 }
 
-/// Builds the gallery sort filter ensuring query sort order matches capture dates.
+/// MediaStore sort expression mirroring photo_manager's Android 10+ (API 29+)
+/// `createDateTime`: `DATE_TAKEN` (ms), or `DATE_ADDED` (s) when `DATE_TAKEN`
+/// is NULL/0. Screenshots, messenger images and downloads often have no
+/// `DATE_TAKEN`; sorting by the raw column puts them all at the end (SQLite
+/// sorts NULL lowest), which made the teleporter jump between years.
+const String androidEffectiveDateSortExpression =
+    'COALESCE(NULLIF(datetaken, 0), date_added * 1000)';
+
+/// Builds the gallery sort filter ensuring query sort order matches the dates
+/// reported by `AssetEntity.createDateTime`, so the list is strictly
+/// newest-to-oldest and the teleporter moves predictably back in time.
 ///
-/// On Android, `FilterOptionGroup` orders by `DATE_ADDED` whereas `AssetEntity.createDateTime`
-/// reads `DATE_TAKEN` (capture date). If photos were imported, synced, or downloaded,
-/// their `DATE_ADDED` differs from their capture date, causing chronological date jumps.
-/// Using [CustomFilter.sql] with `datetaken DESC` ensures query ordering is consistent
-/// with `createDateTime`.
-PMFilter buildGalleryFilterOption() {
-  if (Platform.isAndroid) {
+/// On Android, `FilterOptionGroup` orders by `DATE_ADDED` whereas
+/// `createDateTime` reads `DATE_TAKEN` (falling back to `DATE_ADDED`) on API
+/// 29+, and only `DATE_ADDED` below API 29. The query therefore sorts by the
+/// same effective value. `_id` is a stable tiebreaker so equal timestamps keep
+/// the same order across the separate range queries used for paging.
+///
+/// [simpleColumnsOnly] avoids SQL expressions for MediaStore implementations
+/// that reject them; it is only used as a fallback.
+PMFilter buildGalleryFilterOption({
+  bool? isAndroid,
+  int? androidSdkInt,
+  bool simpleColumnsOnly = false,
+}) {
+  if (isAndroid ?? Platform.isAndroid) {
+    final List<OrderByItem> orderBy;
+    if (androidSdkInt != null && androidSdkInt < 29) {
+      orderBy = const [OrderByItem.desc('date_added')];
+    } else if (simpleColumnsOnly) {
+      orderBy = const [
+        OrderByItem.desc('datetaken'),
+        OrderByItem.desc('date_added'),
+      ];
+    } else {
+      orderBy = const [OrderByItem.desc(androidEffectiveDateSortExpression)];
+    }
     return CustomFilter.sql(
       where: '',
-      orderBy: const [
-        OrderByItem.desc('datetaken'),
-      ],
+      orderBy: [...orderBy, const OrderByItem.desc('_id')],
     );
   }
 
@@ -492,15 +518,52 @@ class _GalleryNukeScreenState extends State<GalleryNukeScreen>
     }
   }
 
+  Future<int?> _androidSdkInt() async {
+    if (!Platform.isAndroid) return null;
+    try {
+      return int.tryParse(await PhotoManager.systemVersion());
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<(AssetPathEntity, int, List<AssetEntity>)?> _queryGallery(
+    PMFilter filter,
+  ) async {
+    final paths = await PhotoManager.getAssetPathList(
+      type: RequestType.image,
+      onlyAll: true,
+      filterOption: filter,
+    );
+    if (paths.isEmpty) return null;
+    final path = paths.first;
+    final total = await path.assetCountAsync;
+    final assets = await path.getAssetListPaged(page: 0, size: 80);
+    return (path, total, assets);
+  }
+
   Future<void> _loadInitialAssets() async {
     try {
-      final paths = await PhotoManager.getAssetPathList(
-        type: RequestType.image,
-        onlyAll: true,
-        filterOption: buildGalleryFilterOption(),
-      );
+      final sdkInt = await _androidSdkInt();
+      (AssetPathEntity, int, List<AssetEntity>)? snapshot;
+      try {
+        snapshot = await _queryGallery(
+          buildGalleryFilterOption(androidSdkInt: sdkInt),
+        );
+      } catch (e) {
+        if (!Platform.isAndroid) rethrow;
+        if (kDebugMode) {
+          print('Effective-date sort rejected, using column sort: $e');
+        }
+        snapshot = await _queryGallery(
+          buildGalleryFilterOption(
+            androidSdkInt: sdkInt,
+            simpleColumnsOnly: true,
+          ),
+        );
+      }
 
-      if (paths.isEmpty) {
+      if (snapshot == null) {
         if (mounted) {
           setState(() {
             _assets = [];
@@ -510,10 +573,9 @@ class _GalleryNukeScreenState extends State<GalleryNukeScreen>
         return;
       }
 
-      _currentPath = paths.first;
+      final (path, total, assets) = snapshot;
+      _currentPath = path;
       _assetGeneration++;
-      final total = await _currentPath!.assetCountAsync;
-      final assets = await _currentPath!.getAssetListPaged(page: 0, size: 80);
 
       if (mounted) {
         setState(() {

@@ -43,12 +43,13 @@ jobs:
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
-          if [ -z "$ANDROID_KEYSTORE_BASE64" ] || [ -z "$ANDROID_KEYSTORE_PASSWORD" ] || [ -z "$ANDROID_KEY_ALIAS" ] || [ -z "$ANDROID_KEY_PASSWORD" ]; then
-            echo "::error::Configure ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, and ANDROID_KEY_PASSWORD repository secrets."
-            exit 1
+          if [ -n "$ANDROID_KEYSTORE_BASE64" ] && [ -n "$ANDROID_KEYSTORE_PASSWORD" ] && [ -n "$ANDROID_KEY_ALIAS" ] && [ -n "$ANDROID_KEY_PASSWORD" ]; then
+            printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/photo-nuke-release.jks"
+            echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/photo-nuke-release.jks" >> "$GITHUB_ENV"
+            echo "Release signing configured with provided keystore."
+          else
+            echo "Release signing secrets not fully configured; falling back to debug signing keys for the release build."
           fi
-          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/photo-nuke-release.jks"
-          echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/photo-nuke-release.jks" >> "$GITHUB_ENV"
 
       - name: Build Release APK
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'

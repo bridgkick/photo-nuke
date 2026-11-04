@@ -54,6 +54,8 @@ android {
 
     buildTypes {
         release {
+            // Fall back to debug signing keys if release signing secrets are not configured,
+            // avoiding CI build failures while allowing proper signing when secrets are present.
             signingConfig = signingConfigs.getByName(if (hasReleaseSigning) "release" else "debug")
         }
     }

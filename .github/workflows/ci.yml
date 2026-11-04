@@ -43,8 +43,12 @@ jobs:
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
+          if [ -z "$ANDROID_KEYSTORE_BASE64" ] && [ -z "$ANDROID_KEYSTORE_PASSWORD" ] && [ -z "$ANDROID_KEY_ALIAS" ] && [ -z "$ANDROID_KEY_PASSWORD" ]; then
+            echo "::warning::No Android signing secrets configured. Using a development debug key; installing future builds may require uninstalling the app."
+            exit 0
+          fi
           if [ -z "$ANDROID_KEYSTORE_BASE64" ] || [ -z "$ANDROID_KEYSTORE_PASSWORD" ] || [ -z "$ANDROID_KEY_ALIAS" ] || [ -z "$ANDROID_KEY_PASSWORD" ]; then
-            echo "::error::Configure ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, and ANDROID_KEY_PASSWORD repository secrets."
+            echo "::error::Android signing secrets are incomplete. Configure all four: ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, ANDROID_KEY_ALIAS, and ANDROID_KEY_PASSWORD."
             exit 1
           fi
           printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/photo-nuke-release.jks"
